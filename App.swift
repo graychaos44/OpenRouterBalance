@@ -13,14 +13,40 @@ struct BalanceInfo {
     let limitReset: String
 }
 
+let refreshIntervals: [(String, TimeInterval)] = [
+    ("1 min", 60),
+    ("3 min", 180),
+    ("5 min", 300),
+    ("10 min", 600),
+    ("30 min", 1800),
+    ("1 hour", 3600),
+]
+
 class BalanceVM: ObservableObject {
     @Published var info: BalanceInfo?
     @Published var isLoading = false
     @Published var errorMsg: String?
     @Published var accountBalance: Double = 10.0
+    @Published var refreshIntervalIndex: Int = 2 { // default: 5 min
+        didSet { saveRefreshInterval(); restartTimer() }
+    }
     private let totalCredit: Double = 10.0
+    @Published var apiKeyInput: String = ""
     private var refreshTimer: Timer?
-    private let apiKey: String = OpenRouterBalanceApp.loadApiKey()
+    private var _apiKey: String = ""
+    private let defaults = UserDefaults.standard
+    private let refreshKey = "refreshIntervalIndex"
+    private let apiKeyKey = "openrouter_api_key"
+
+    init() {
+        refreshIntervalIndex = loadRefreshInterval()
+        _apiKey = loadApiKey()
+        apiKeyInput = _apiKey
+    }
+
+    var currentApiKey: String {
+        return _apiKey
+    }
 
     func fetch() {
         guard !isLoading else { return }
@@ -32,7 +58,7 @@ class BalanceVM: ObservableObject {
             return
         }
         var req = URLRequest(url: url)
-        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        req.setValue("Bearer \(_apiKey)", forHTTPHeaderField: "Authorization")
         URLSession.shared.dataTask(with: req) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 self?.isLoading = false
@@ -44,7 +70,6 @@ class BalanceVM: ObservableObject {
                     self?.errorMsg = "No data"
                     return
                 }
-                // Manual JSON parsing to avoid Codable issues
                 do {
                     guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                           let d = json["data"] as? [String: Any] else {
@@ -69,16 +94,57 @@ class BalanceVM: ObservableObject {
             }
         }.resume()
     }
-    
+
     func startAutoRefresh() {
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+        let interval = refreshIntervals[refreshIntervalIndex].1
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.fetch()
         }
     }
-    
+
+    func restartTimer() {
+        stopAutoRefresh()
+        startAutoRefresh()
+    }
+
     func stopAutoRefresh() {
         refreshTimer?.invalidate()
         refreshTimer = nil
+    }
+
+    var refreshIntervalLabel: String {
+        refreshIntervals[refreshIntervalIndex].0
+    }
+
+    func saveApiKey() {
+        let key = apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+        _apiKey = key
+        defaults.set(key, forKey: apiKeyKey)
+        fetch()
+    }
+
+    private func saveRefreshInterval() {
+        defaults.set(refreshIntervalIndex, forKey: refreshKey)
+    }
+
+    private func loadRefreshInterval() -> Int {
+        let saved = defaults.integer(forKey: refreshKey)
+        return (saved >= 0 && saved < refreshIntervals.count) ? saved : 2
+    }
+
+    private func loadApiKey() -> String {
+        // 1. UserDefaults
+        if let saved = defaults.string(forKey: apiKeyKey), !saved.isEmpty {
+            return saved
+        }
+        // 2. File
+        let keyFile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".openrouter_api_key")
+        if let key = try? String(contentsOf: keyFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+            return key
+        }
+        // 3. Env var
+        return ProcessInfo.processInfo.environment["OPENROUTER_API_KEY"] ?? ""
     }
 }
 
@@ -91,24 +157,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 280, height: 500)
+        popover.contentSize = NSSize(width: 280, height: 580)
         popover.contentViewController = NSHostingController(rootView: PopoverView(vm: vm))
         self.popover = popover
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "💳⏳"
         let button = statusItem.button!
-        button.action = #selector(togglePopover)
+        button.action = #selector(statusBarButtonClicked(_:))
         button.target = self
-
-        // Right-click menu
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Refresh Now", action: #selector(forceRefresh), keyEquivalent: "r"))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q"))
-        // Use right-click menu via button menu, not statusItem.menu
-        button.menu = menu
-        button.sendAction(on: .leftMouseUp)
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
         vm.fetch()
         vm.startAutoRefresh()
@@ -126,6 +184,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let weeklyRem = String(format: "%.2f", info.limitRemaining)
             let acct = String(format: "%.2f", vm.accountBalance)
             statusItem.button?.title = "💳\(acct) | \(weeklyRem)"
+        }
+    }
+
+    @objc func statusBarButtonClicked(_ sender: NSStatusBarButton) {
+        let event = NSApp.currentEvent!
+        if event.type == .rightMouseUp {
+            let menu = NSMenu()
+            menu.addItem(NSMenuItem(title: "Refresh Now", action: #selector(forceRefresh), keyEquivalent: "r"))
+            menu.addItem(NSMenuItem.separator())
+            menu.addItem(NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q"))
+            NSMenu.popUpContextMenu(menu, with: event, for: sender)
+        } else {
+            togglePopover()
         }
     }
 
@@ -238,7 +309,47 @@ struct PopoverView: View {
                             .font(.callout).foregroundColor(.secondary)
                     }
 
-                } else if vm.isLoading {
+                    Divider()
+
+                    // Refresh interval setting
+                    HStack {
+                        Image(systemName: "clock")
+                            .foregroundColor(.secondary)
+                        Text("Auto-refresh")
+                            .fontWeight(.semibold)
+                            .font(.callout)
+                    }
+
+                    Picker("", selection: $vm.refreshIntervalIndex) {
+                        ForEach(0..<refreshIntervals.count, id: \.self) { i in
+                            Text(refreshIntervals[i].0).tag(i)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .font(.callout)
+
+                    Divider()
+
+                    // API Key setting
+                    HStack {
+                        Image(systemName: "key")
+                            .foregroundColor(.secondary)
+                        Text("API Key")
+                            .fontWeight(.semibold)
+                            .font(.callout)
+                    }
+
+                    HStack {
+                        SecureField("sk-or-v1-...", text: $vm.apiKeyInput)
+                            .font(.callout)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit { vm.saveApiKey() }
+                        Button("Save") { vm.saveApiKey() }
+                            .font(.callout)
+                            .buttonStyle(.borderless)
+                    }
+
+                    } else if vm.isLoading {
                     HStack { Spacer(); ProgressView(); Spacer() }
                 } else {
                     if let err = vm.errorMsg {
@@ -250,9 +361,6 @@ struct PopoverView: View {
                         .foregroundColor(.secondary)
                 }
 
-                Text("Auto-refresh: 5min")
-                        .font(.callout)
-                        .foregroundColor(.secondary)
                 Button { vm.fetch() } label: {
                     HStack {
                         Image(systemName: "arrow.clockwise")
