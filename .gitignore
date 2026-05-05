@@ -1,0 +1,8 @@
+# Build output
+OpenRouterBalance.app/
+
+# iOS version (unused)
+main.swift
+
+# macOS
+.DS_Store
